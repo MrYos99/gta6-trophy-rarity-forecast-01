@@ -142,3 +142,92 @@ removed is replaced by a parameter that does the same job deliberately.
   harness, which models earners growing with the base, is the better guide;
   the practice number under the flat-earner assumption should not be used to
   compare the old and tuned models.
+
+## Results — dilution variant (main.ts as committed, 2026-11-20)
+
+The variant fits earners E(t) and the tracked base N(t) separately in
+log-time (r = E/N), with the base as a jump-decay model (log-jumps decay
+geometrically; ρ = median of the last three jump ratios, cadence = median
+refresh gap; future jumps summed to the last refresh ≤ target) and a
+count-consistent anchored median. Same 12 scenarios, same scoring, same
+baselines — apples to apples with the table above.
+
+| scenario | ours | persistence | curve | margin vs best house |
+|---|---:|---:|---:|---:|
+| s-cad2h-linear | 0.2340 | 0.3823 | 0.2744 | +0.0404 |
+| s-cad2h-saturating | 0.2506 | 0.2329 | 0.3677 | -0.0177 |
+| s-cad4h-linear | 0.2512 | 0.3841 | 0.2851 | +0.0339 |
+| s-cad4h-saturating | 0.1899 | 0.2329 | 0.3661 | +0.0430 |
+| s-cad8h-linear | 0.2102 | 0.3892 | 0.3069 | +0.0967 |
+| s-cad8h-saturating | 0.1580 | 0.2349 | 0.2531 | +0.0768 |
+| s-cad12h-linear | 0.2460 | 0.3369 | 0.5947 | +0.0909 |
+| s-cad12h-saturating | 0.1765 | 0.2245 | 0.3753 | +0.0480 |
+| s-cad4h-linear-d030 | 0.2146 | 0.4180 | 0.2494 | +0.0349 |
+| s-cad4h-saturating-d030 | 0.1524 | 0.2430 | 0.2499 | +0.0906 |
+| s-cad4h-linear-d060 | 0.1508 | 0.1614 | 0.1614 | +0.0106 |
+| s-cad4h-saturating-d060 | 0.1176 | 0.1184 | 0.1184 | +0.0007 |
+| **worst-case** | **0.2512** | | | **wins 11/12, mean 0.1960** |
+
+Baseline on the same 12: worst-case 0.2861, wins 11/12, mean 0.2076. The
+variant improves worst-case by 0.035 and mean by 0.012, and its only loss
+(s-cad2h-saturating, −0.0177) is smaller than the baseline's loss there
+(−0.0296). It is worse than the baseline on three scenarios — d030-sat
+(0.1524 vs 0.1473), d060-lin (0.1508 vs 0.1458), d060-sat (0.1176 vs 0.0778)
+— all fast-dilution worlds where floor-pinned trophies dominate the loss.
+
+One tuning pass was run on this variant (via `--override`, cases reused):
+DAMP 0.5 → worst 0.2753, 12/12; DAMP 0.8 → 0.3093, 9/12; DAMP 1.0 → 0.4016,
+8/12; SIGMA_SCALE 0.5 → worst 0.2504, mean 0.1892, 11/12; SIGMA_SCALE 0.8 →
+0.2747, 8/12. Defaults DAMP 0.65 / SIGMA_SCALE 0.6 were KEPT: the SIGMA 0.5
+gain (Δ0.002 worst-case) is noise and narrows the spread on a less-proven
+median. Practice under the ASSUMED answer is identical to the baseline
+(0.6937 / 0.6945; medians id1 0.3675, id2 99.99, id3 0.7292) — the frozen
+rule fires on the practice history, so the dilution path is not exercised
+there. Determinism re-verified (two practice runs byte-identical).
+
+### Dilution stress scenarios (`validation/dilution_stress.py`)
+
+The 12 scenarios have N essentially saturated by the checkpoint, so they
+under-test dilution. The stress generator adds four SEPARATE scenarios
+(decay 0.60, 8h/12h cadence) where N still grows ~×1.7 (8h) / ~×4 (12h)
+after the checkpoint. They are not part of the 12-scenario comparison.
+
+| scenario | variant | baseline | persistence | curve |
+|---|---:|---:|---:|---:|
+| s-cad8h-linear-d060 | 0.1703 | 0.1042 | 0.1404 | 0.1885 |
+| s-cad8h-saturating-d060 | 0.1552 | 0.1285 | 0.1368 | 0.1045 |
+| s-cad12h-linear-d060 | 0.0923 | 0.1835 | 0.1269 | 0.1431 |
+| s-cad12h-saturating-d060 | 0.1350 | 0.5810 | 0.2850 | 0.0850 |
+| **worst-case** | **0.1703** | **0.5810** | | |
+
+Variant stress mean 0.1382 vs baseline 0.2493. The variant wins the 12h
+pair decisively (the baseline's 12h-saturating 0.5810 is its worst failure
+anywhere) and loses the 8h pair. The 8h loss is diagnosed per-trophy:
+floor-pinned trophies (last = 0.01, answer = 0.01) are forecast at ~0.0155
+because a printed rate stuck at the 0.01 floor while N grows fakes earner
+growth in the reconstruction (E = rate × N grows ∝ N while the rate is
+pinned). A flat print cannot separate genuine earner growth from base
+growth — that is unidentifiable from the data, and the baseline wins there
+only because flat-in → flat-out happens to match the truth in those worlds.
+
+### Rejected fixes (measured, not assumed)
+
+- **Pinned-rate guard** (span ≤ 0.01 and last ≤ 0.10 → direct fit): fixed
+  d060 but fired on 48/55 trophies in cad4h-saturating and killed its gains
+  (mean delta +0.0415). Removed.
+- **Dropping 0.00 reads from the E fit** (with a flat-only guard): mean
+  0.1972 / worst 0.2554; dropping the guard alone made d060-linear much
+  worse (0.2442, 9/12) because all-zero trophies lost their E anchor and
+  the direct fallback's class-mean slope lifted them. Removed. Kept instead:
+  midpoint censoring — 0.00% prints reconstructed as E = 0.0025% × N.
+- **Window-base-growth correction** (subtract the window's own ln N slope
+  from the earner slope, and from the class means): fixed the stress 8h pair
+  (3/4 stress wins) but collapsed the main harness worst-case 0.2512 →
+  0.4255 (cad12h-linear). For resolved rates the base growth is already
+  netted out of the earner fit through the rate's own movement — subtracting
+  it again double-counts. Removed in full.
+- **ρ estimator**: OLS of ln g_k on k was replaced by the median of the last
+  three jump ratios (early ratios overstate the decay: in the 8h-d060 stress
+  world OLS gave ρ ≈ 0.70 vs the true 0.60). Main-12 effect negligible
+  (mean 0.1963 → 0.1960, worst 0.2524 → 0.2512); kept on principle, since
+  only recent ratios govern the next jumps.

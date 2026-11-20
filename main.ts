@@ -1,44 +1,47 @@
 // GTA VI trophy rarity forecaster — gta6-trophy-rarity-forecast-01 (Node 22, standard library only).
 //
-// Model: shrunk log-time trend on the rate itself + honest spread.
+// Model (DILUTION variant): separate earner / tracked-base fits, count-consistent.
 //
-// An Exophase rate is earners / players_tracked, and both parts move — but forecasting the
-// two parts separately was tried and dropped: the tracked base's growth is convex in
-// log-time, so any linear base fit under-forecasts it by ~2x at a 4.5-day horizon, and
-// that error divides straight into every rate. One extrapolation beats two. So this
-// program fits the rate directly, in logit space, against ln(1 + hours since release):
+// An Exophase rate is r = E / N, and the two parts move differently: earners E_i(t)
+// grow continuously as players play, while the tracked base N(t) jumps at Exophase
+// refreshes and sits frozen between them. The rate dilutes whenever the base
+// outgrows a trophy's earners. So this program forecasts the two parts separately
+// and divides:
 //
-//   logit(r) = a + b * ln(1 + hours)
+//   E_i:  ln(E_i) fit on x = ln(1 + hours since release), per trophy, over the
+//         most recent reads only, earner-weighted, slope shrunk toward its class
+//         mean and clamped to [0, 1]. (d ln E / dx <= 1 for any E growing at most
+//         linearly in time; a saturating earner curve has slope -> 0.)
+//   N:    the observed refresh jumps, g_k = ln(N_k / N_{k-1}), decay geometrically:
+//         ln g_k is fit linearly in k (ratio rho), the refresh cadence is the median
+//         gap between observed refreshes, and future jumps g_K * rho^j are summed
+//         up to the last refresh at or before the target. N is a step function, so
+//         the answer is the page state at that last refresh, not at the target
+//         instant itself. This is the whole point of the variant: ln N in log-time
+//         is strongly concave (the base's growth saturates — the first jump is x6,
+//         later jumps decay toward x1), so any straight-line ln N fit is badly wrong
+//         at a 4.5-day horizon, in either direction depending on the window. The
+//         jump-decay model extrapolates the *jumps*, which is what actually moves N.
+//   r:    r_line(x) = E_line(x) / N(x), in logit space.
 //
-// over the most recent reads only (the last 24 hours when they hold 4+ distinct reads,
-// else the last 48, else all). The local slope is what extrapolates: the launch transient
-// would bend a longer fit, and logit(r) is concave in log-time, so a long window's average
-// slope overstates the future. Reads are deduplicated first — Exophase refreshes in jumps,
-// so long frozen stretches carry no information and would fake certainty (a flat stretch
-// looks like zero variance). Each read is weighted by its earner count (a rate's logit is
-// only as precise as its numerator).
+// Count-consistency: the median is anchored to the last observed read, and only the
+// MOVE comes from the decomposition: median = logit(last) + DAMP * (logit(r_line at
+// the answering refresh) - logit(r_line at the last refresh)). At zero horizon the
+// forecast is exactly the last read — the forecast counts reconcile with the observed
+// counts at the checkpoint by construction, and the E/N lines only supply the change.
+// A trophy already at (or near) 100% is exempt (E = N always, it cannot dilute).
 //
-// The per-trophy slope is shrunk toward its class mean (story / activity / grind, classified
-// from the trophy's own description, plus a platinum class), because a handful of noisy,
-// quantised reads cannot support a free slope per trophy. Slopes may go mildly negative
-// (a rate can fall when the base outgrows its earners — the platinum does exactly this),
-// clamped to [-0.5, 3.5]. The extrapolated move from the last read is damped (x0.85).
-// The spread is the fit residual plus slope uncertainty times the extrapolation distance
-// plus a random-walk term, floored and capped: a 4.5-day launch-week extrapolation is
-// genuinely uncertain, and pinball loss punishes a too-narrow band far more than a
-// slightly-too-wide one.
+// The same machinery as the rate-fit model is kept where it still applies:
+// deduplication of frozen reads, earner weighting, class shrinkage, honest spread
+// (now with an extra N-uncertainty term from the extrapolated jumps), and the frozen
+// page rule (fewer than 3 distinct reads, short horizon: next read is a refresh
+// jump, base ~x6, earners ~x3.5). When the N jump model cannot be estimated (too few
+// distinct base values, no cadence), the program falls back to the direct shrunk
+// log-time rate fit.
 //
-// Frozen pages: when the history holds fewer than 3 distinct reads (the page has not moved
-// since launch night) and the horizon is short, there is no trend signal at all — the next
-// read is a refresh jump. The median then assumes the tracked base multiplies (~6x, the one
-// refresh the rules disclose) while earners grow with it (~3.5x), and the spread is widened
-// a lot. A trophy already at 100% is exempt: it stayed at 100% across the disclosed x6.06
-// refresh. This rule is gated to short horizons, so it can never fire on the final case
-// (6,510 minutes).
-//
-// Deterministic: pure arithmetic, no randomness, no clock, no network. Two runs write the
-// same bytes. Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else
-// /output), one <id>.out per <id>.in, in name order.
+// Deterministic: pure arithmetic, no randomness, no clock, no network. Two runs write
+// the same bytes. Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR
+// (else /output), one <id>.out per <id>.in, in name order.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -91,6 +94,26 @@ const WINDOW_MIN_READS = 3;
  * is disclosed in the README, and it is the price of the worst-case win. */
 const SLOPE_MIN = 0.0;
 const SLOPE_MAX = 3.5;
+/** Earner-slope clamp (dilution path). E_SLOPE_MAX = 1.0: for earners growing at
+ * most linearly in time, d ln E / d ln(1+t) = (1+t)/(h+t) < 1; a saturating earner
+ * curve has slope -> 0. The floor is 0 for the same staircase reason as the rate
+ * fit: a fitted negative earner slope on refresh-sampled points is noise, not
+ * players un-earning trophies. */
+const E_SLOPE_MIN = 0.0;
+const E_SLOPE_MAX = 1.0;
+/** Base jump-decay model (dilution path). RHO is the per-refresh decay ratio of
+ * the log-jumps, taken as the median of the last three observed ratios and
+ * clamped here: below 0.2 the base is already saturated (future jumps ~0),
+ * above 0.85 the jumps barely decay and the base keeps growing. RHO_PRIOR =
+ * 0.5 is used when too few jumps exist to form a ratio (the disclosed first
+ * refresh x6.06 followed by decaying jumps; 0.5 sits between the early
+ * observed ratios ~0.6 and the late asymptote ~0.45 of a geometric decay).
+ * N_JUMP_SIGMA_FRAC = 0.5: each extrapolated future log-jump is uncertain
+ * by ~half its size, and those uncertainties add in quadrature to the spread. */
+const N_RHO_MIN = 0.2;
+const N_RHO_MAX = 0.85;
+const N_RHO_PRIOR = 0.5;
+const N_JUMP_SIGMA_FRAC = 0.5;
 /** Frozen-page prior: the tracked base multiplies by this at the next refresh.
  * The one refresh the rules disclose is x6.06 (638 -> 3,868 players tracked). */
 const FROZEN_BASE_JUMP = 6;
@@ -222,8 +245,196 @@ function trophyClass(t: Trophy): 'story' | 'activity' | 'grind' | 'platinum' {
   return 'activity';
 }
 
-/** One trophy's forecast row. */
+/** The tracked-base jump model: N extrapolated by decaying refresh jumps. */
+interface NModel {
+  /** ln N at the last observed refresh. */
+  logNLast: number;
+  /** ln N at the answering refresh (last refresh at or before the target). */
+  logNAnswer: number;
+  /** ms of the last observed refresh. */
+  lastRefreshMs: number;
+  /** ms of the answering refresh. */
+  answerMs: number;
+  /** Number of future refreshes at or before the target. */
+  futureJumps: number;
+  /** Spread contribution (logit units) of the extrapolated jumps. */
+  sigmaN: number;
+}
+
+/**
+ * Fit the base jump model from the deduplicated history. Returns null when the
+ * jumps cannot be estimated (too few distinct base values, a non-positive jump,
+ * or no refresh cadence) — the caller then falls back to the direct rate fit.
+ */
+function fitNModel(kept: Read[], targetMs: number): NModel | null {
+  // Distinct base values with their refresh instants.
+  const series: Array<{ tMs: number; n: number }> = [];
+  for (const r of kept) {
+    const tMs = Date.parse(r.at);
+    if (!Number.isFinite(tMs) || !(r.players_tracked > 0)) continue;
+    if (series.length === 0 || r.players_tracked !== series[series.length - 1].n) {
+      series.push({ tMs, n: r.players_tracked });
+    }
+  }
+  if (series.length < 3) return null;
+  const K = series.length - 1;
+  const g: number[] = [];
+  for (let k = 1; k <= K; k++) {
+    const gk = Math.log(series[k].n / series[k - 1].n);
+    // The tracked base never shrinks; a non-positive jump is bad data.
+    if (!(gk > 0) || !Number.isFinite(gk)) return null;
+    g.push(gk);
+  }
+  const gLast = g[g.length - 1];
+  // Decay ratio: median of the last up-to-three consecutive log-jump ratios.
+  // Only the most recent ratios govern the next jumps, and early ratios
+  // overstate the decay: for geometrically decaying multipliers, ln(1 + c*d^k)
+  // ratios approach d from above, so an average over all jumps (or an OLS fit
+  // on ln g_k) inherits the early transient and over-forecasts future base
+  // growth. With fewer than two jumps there is no ratio; keep the prior.
+  let rho = N_RHO_PRIOR;
+  const ratios: number[] = [];
+  for (let k = 1; k < g.length; k++) ratios.push(g[k] / g[k - 1]);
+  const recent = ratios.slice(-3).sort((a, b) => a - b);
+  if (recent.length > 0) {
+    rho = recent.length % 2 === 1
+      ? recent[(recent.length - 1) / 2]
+      : (recent[recent.length / 2 - 1] + recent[recent.length / 2]) / 2;
+    rho = clamp(rho, N_RHO_MIN, N_RHO_MAX);
+  }
+  // Cadence: median gap between refreshes, excluding the first gap — it spans
+  // the pre-first-refresh freeze, not a refresh interval.
+  const gaps: number[] = [];
+  for (let k = 2; k <= K; k++) gaps.push(series[k].tMs - series[k - 1].tMs);
+  gaps.sort((a, b) => a - b);
+  const cadenceMs = gaps.length % 2 === 1
+    ? gaps[(gaps.length - 1) / 2]
+    : (gaps[gaps.length / 2 - 1] + gaps[gaps.length / 2]) / 2;
+  if (!(cadenceMs > 0) || !Number.isFinite(cadenceMs)) return null;
+  if (!Number.isFinite(targetMs)) return null;
+  const tLast = series[K].tMs;
+  let future = 0;
+  let sumG = 0;
+  let sumVar = 0;
+  for (let j = 1; j <= 10000; j++) {
+    if (tLast + j * cadenceMs > targetMs) break;
+    const gj = gLast * Math.pow(rho, j);
+    sumG += gj;
+    sumVar += (N_JUMP_SIGMA_FRAC * gj) * (N_JUMP_SIGMA_FRAC * gj);
+    future++;
+  }
+  const logNLast = Math.log(series[K].n);
+  return {
+    logNLast,
+    logNAnswer: logNLast + sumG,
+    lastRefreshMs: tLast,
+    answerMs: tLast + future * cadenceMs,
+    futureJumps: future,
+    sigmaN: Math.sqrt(sumVar),
+  };
+}
+
+/**
+ * One trophy's forecast row — dilution path. The median is the last read moved
+ * by the E/N decomposition's implied logit move between the last refresh and
+ * the answering refresh, damped; the spread adds the N-extrapolation
+ * uncertainty. Falls back to the direct rate fit when the earner fit or the
+ * base jump model is unavailable.
+ */
 function forecastTrophy(
+  t: Trophy,
+  ePts: Array<{ x: number; y: number; w: number }>,
+  ratePts: Array<{ x: number; y: number; w: number }>,
+  lastRate: number,
+  earnersLast: number,
+  nBase: number,
+  classESlope: number,
+  classRateSlope: number,
+  globalResidE: number,
+  globalResidRate: number,
+  xAt: number,
+  xTarget: number,
+  days: number,
+  frozen: boolean,
+  nModel: NModel | null,
+  xLastRefresh: number,
+  xAnswer: number,
+): { id: number; q: number[] } {
+  const eFit = ePts.length >= 2
+    ? wls(ePts.map((p) => p.x), ePts.map((p) => p.y), ePts.map((p) => p.w))
+    : null;
+  // A 0.00% print is censored, not zero (see forecastCase), so the earner fit
+  // may be unavailable even when the rate fit is not.
+  if (eFit === null || nModel === null) {
+    return forecastTrophyDirect(t, ratePts, lastRate, earnersLast, nBase,
+      classRateSlope, globalResidRate, xAt, xTarget, days, frozen);
+  }
+
+  // Earner slope: shrink the per-trophy fit toward the class mean. No
+  // correction for the base growth inside the window is applied, deliberately:
+  // ln E = ln r + ln N, so the window's base growth is already netted out of
+  // the earner fit through the rate's own movement — subtracting the ln N
+  // slope again double-counts it (verified on the harness: the correction
+  // collapses the 12h-linear worst case from 0.25 to 0.43). The correction
+  // only helps for flat, censored prints, where the rate cannot move; there
+  // the fit is left as-is and the residual bias is disclosed in the README.
+  let eSlope: number;
+  let seSlope: number;
+  let resid: number;
+  if (ePts.length >= 3 && Number.isFinite(eFit.seB)) {
+    const se = Math.max(eFit.seB, 0.3);
+    const wOwn = 1 / (se * se);
+    const wPrior = 1 / (SLOPE_PRIOR_SD * SLOPE_PRIOR_SD);
+    eSlope = (eFit.b * wOwn + classESlope * wPrior) / (wOwn + wPrior);
+    seSlope = 1 / Math.sqrt(wOwn + wPrior);
+    resid = Math.max(eFit.residSd, 0.15);
+  } else {
+    // Two points define a line but say nothing about its error.
+    eSlope = 0.5 * eFit.b + 0.5 * classESlope;
+    seSlope = 1.2;
+    resid = Math.max(eFit.residSd, 0.3);
+  }
+  eSlope = clamp(eSlope, E_SLOPE_MIN, E_SLOPE_MAX);
+
+  // The decomposition's implied rate at the last refresh and at the answering
+  // refresh, both from the same E line (centroid pivot) and N model — so the
+  // level residual cancels and only the move is used.
+  const eAtLast = eFit.a + eFit.b * eFit.mx + eSlope * (xLastRefresh - eFit.mx);
+  const eAtAnswer = eFit.a + eFit.b * eFit.mx + eSlope * (xAnswer - eFit.mx);
+  const rLast = clamp(Math.exp(eAtLast - nModel.logNLast) * 100, 0.01, 99.99);
+  const rAnswer = clamp(Math.exp(eAtAnswer - nModel.logNAnswer) * 100, 0.01, 99.99);
+  let medianLogit = logit(lastRate) + DAMP * (logit(rAnswer) - logit(rLast));
+
+  // Frozen page, short horizon: same rule as the direct fit — the next read is
+  // a refresh jump, base ~6x, earners ~3.5x; the 100% trophy is exempt.
+  let sigmaExtra = 0;
+  if (frozen) {
+    if (lastRate >= 99.9) {
+      medianLogit = logit(lastRate);
+    } else {
+      medianLogit = logit(clamp(100 * earnersLast * FROZEN_EARNER_GROWTH /
+        (nBase * FROZEN_BASE_JUMP), 0.01, 99.99));
+    }
+    sigmaExtra = FROZEN_SIGMA_EXTRA;
+    resid = Math.max(resid, 0.3);
+  }
+
+  const dx = Math.max(0, xAnswer - xLastRefresh);
+  const sigma = clamp(
+    SIGMA_SCALE * Math.sqrt(resid * resid + (seSlope * dx) * (seSlope * dx) +
+      (SIGMA_RW * Math.sqrt(days)) * (SIGMA_RW * Math.sqrt(days)) +
+      nModel.sigmaN * nModel.sigmaN + sigmaExtra * sigmaExtra),
+    SIGMA_MIN,
+    SIGMA_MAX,
+  );
+  const q = LEVELS.map((tau) =>
+    round4(clamp(invLogit(medianLogit + normQuantile(tau) * sigma), 0, 100)));
+  for (let i = 1; i < q.length; i++) q[i] = Math.max(q[i], q[i - 1]);
+  return { id: t.id, q };
+}
+
+/** One trophy's forecast row — direct shrunk log-time rate fit (fallback). */
+function forecastTrophyDirect(
   t: Trophy,
   pts: Array<{ x: number; y: number; w: number }>,
   lastRate: number,
@@ -336,11 +547,16 @@ function forecastCase(c: CaseFile): { trophies: Array<{ id: number; q: number[] 
   const lastRead = c.history[c.history.length - 1];
   const nBase = lastRead ? lastRead.players_tracked : 1;
 
-  // Per-trophy points: logit(rate) on ln(1 + hours), weighted by earner count.
-  // Window: the last 24h when it holds 4+ distinct reads, else the last 48h, else all.
+  // Per-trophy points, two views of the same reads: logit(rate) on ln(1 + hours)
+  // (direct-fit fallback) and ln(earners) on ln(1 + hours) (dilution path).
+  // Earners are reconstructed count-consistently: E = rate * N / 100 from the
+  // read's own rate and players_tracked, with +0.5 smoothing so a 0.00% rate
+  // (zero observed earners) still has a finite log. Window: the last 24h when it
+  // holds 3+ distinct reads, else the last 48h, else all.
   const xCut24 = Math.log(1 + Math.max(0, hoursAt - 24));
   const xCut48 = Math.log(1 + Math.max(0, hoursAt - 48));
-  const pointsByTrophy: Array<Array<{ x: number; y: number; w: number }>> = c.trophies.map(() => []);
+  const ratePtsByTrophy: Array<Array<{ x: number; y: number; w: number }>> = c.trophies.map(() => []);
+  const ePtsByTrophy: Array<Array<{ x: number; y: number; w: number }>> = c.trophies.map(() => []);
   const lastRateByTrophy: number[] = c.trophies.map(() => 1);
   const earnersLastByTrophy: number[] = c.trophies.map(() => 0);
   for (const r of kept) {
@@ -348,21 +564,29 @@ function forecastCase(c: CaseFile): { trophies: Array<{ id: number; q: number[] 
     c.trophies.forEach((_, i) => {
       const rate = r.rates[i];
       if (typeof rate === 'number' && Number.isFinite(rate) && r.players_tracked > 0) {
-        pointsByTrophy[i].push({
-          x,
-          y: logit(rate),
-          w: (rate / 100) * r.players_tracked + 0.5,
-        });
+        // Earners are reconstructed from the print's midpoint. A 0.00% print is
+        // censored, not zero: it only says the true rate is in [0, 0.005%),
+        // whose midpoint is 0.0025% — using 0 (+0.5 smoothing) would fake a
+        // huge ln E rise when the trophy first prints 0.01, and dropping the
+        // read would erase the (real) information that the rate fell to the
+        // floor. The midpoint keeps the fit honest about what a 0.00 print is.
+        // (The rate fit keeps the baseline's own weight, rate x N / 100 + 0.5.)
+        const earners = (rate / 100) * r.players_tracked;
+        const effEarners = ((rate > 0 ? rate : 0.0025) / 100) * r.players_tracked;
+        ratePtsByTrophy[i].push({ x, y: logit(rate), w: earners + 0.5 });
+        ePtsByTrophy[i].push({ x, y: Math.log(effEarners + 0.5), w: effEarners + 0.5 });
       }
     });
   }
-  const windowed = pointsByTrophy.map((pts) => {
+  const windowPts = (pts: Array<{ x: number; y: number; w: number }>) => {
     const w24 = pts.filter((p) => p.x >= xCut24);
     if (w24.length >= WINDOW_MIN_READS) return w24;
     const w48 = pts.filter((p) => p.x >= xCut48);
     if (w48.length >= WINDOW_MIN_READS) return w48;
     return pts;
-  });
+  };
+  const windowedRate = ratePtsByTrophy.map(windowPts);
+  const windowedE = ePtsByTrophy.map(windowPts);
   c.trophies.forEach((_, i) => {
     for (let k = c.history.length - 1; k >= 0; k--) {
       const rate = c.history[k].rates[i];
@@ -374,56 +598,78 @@ function forecastCase(c: CaseFile): { trophies: Array<{ id: number; q: number[] 
     }
   });
 
-  // Class slope means from trophies with a usable fit (precision-weighted).
-  const classSlopes = new Map<string, number>();
-  const classes = ['story', 'activity', 'grind', 'platinum'];
-  let globalNum = 0;
-  let globalDen = 0;
-  let residSum = 0;
-  let residCount = 0;
-  for (const cls of classes) {
-    let num = 0;
-    let den = 0;
-    c.trophies.forEach((t, i) => {
-      if (trophyClass(t) !== cls) return;
-      const pts = windowed[i];
-      if (pts.length < 3) return;
-      const fit = wls(
-        pts.map((p) => p.x),
-        pts.map((p) => p.y),
-        pts.map((p) => p.w),
-      );
-      if (fit === null || !Number.isFinite(fit.seB)) return;
-      const se = Math.max(fit.seB, 0.3);
-      const w = 1 / (se * se + SLOPE_PRIOR_SD * SLOPE_PRIOR_SD);
-      num += clamp(fit.b, SLOPE_MIN, SLOPE_MAX) * w;
-      den += w;
-      globalNum += clamp(fit.b, SLOPE_MIN, SLOPE_MAX) * w;
-      globalDen += w;
-      residSum += Math.max(fit.residSd, 0.15);
-      residCount += 1;
-    });
-    classSlopes.set(cls, den > 0 ? num / den : NaN);
-  }
-  const globalSlope = globalDen > 0 ? globalNum / globalDen : 0;
-  for (const cls of classes) {
-    if (!Number.isFinite(classSlopes.get(cls) as number)) classSlopes.set(cls, globalSlope);
-  }
-  const globalResid = residCount > 0 ? residSum / residCount : 0.4;
+  // Class slope means from trophies with a usable fit (precision-weighted),
+  // computed separately for the earner slopes and the rate slopes.
+  const classMeans = (
+    windowed: Array<Array<{ x: number; y: number; w: number }>>,
+    lo: number,
+    hi: number,
+  ): { map: Map<string, number>; globalResid: number } => {
+    const map = new Map<string, number>();
+    const classes = ['story', 'activity', 'grind', 'platinum'];
+    let globalNum = 0;
+    let globalDen = 0;
+    let residSum = 0;
+    let residCount = 0;
+    for (const cls of classes) {
+      let num = 0;
+      let den = 0;
+      c.trophies.forEach((t, i) => {
+        if (trophyClass(t) !== cls) return;
+        const pts = windowed[i];
+        if (pts.length < 3) return;
+        const fit = wls(
+          pts.map((p) => p.x),
+          pts.map((p) => p.y),
+          pts.map((p) => p.w),
+        );
+        if (fit === null || !Number.isFinite(fit.seB)) return;
+        const se = Math.max(fit.seB, 0.3);
+        const w = 1 / (se * se + SLOPE_PRIOR_SD * SLOPE_PRIOR_SD);
+        num += clamp(fit.b, lo, hi) * w;
+        den += w;
+        globalNum += clamp(fit.b, lo, hi) * w;
+        globalDen += w;
+        residSum += Math.max(fit.residSd, 0.15);
+        residCount += 1;
+      });
+      map.set(cls, den > 0 ? num / den : NaN);
+    }
+    const globalSlope = globalDen > 0 ? globalNum / globalDen : 0;
+    for (const cls of classes) {
+      if (!Number.isFinite(map.get(cls) as number)) map.set(cls, globalSlope);
+    }
+    return { map, globalResid: residCount > 0 ? residSum / residCount : 0.4 };
+  };
+  const eMeans = classMeans(windowedE, E_SLOPE_MIN, E_SLOPE_MAX);
+  const rateMeans = classMeans(windowedRate, SLOPE_MIN, SLOPE_MAX);
+
+  // Base jump model + the answering refresh (last refresh at or before target).
+  const nModel = fitNModel(kept, targetMs);
+  const xOfMs = (tMs: number): number =>
+    Math.log(1 + Math.max(0, (tMs - release) / 3_600_000));
+  const xLastRefresh = nModel !== null ? xOfMs(nModel.lastRefreshMs) : xAt;
+  const xAnswer = nModel !== null ? xOfMs(nModel.answerMs) : xTarget;
 
   const trophies = c.trophies.map((t, i) =>
     forecastTrophy(
       t,
-      windowed[i],
+      windowedE[i],
+      windowedRate[i],
       lastRateByTrophy[i],
       earnersLastByTrophy[i],
       nBase,
-      classSlopes.get(trophyClass(t)) as number,
-      globalResid,
+      eMeans.map.get(trophyClass(t)) as number,
+      rateMeans.map.get(trophyClass(t)) as number,
+      eMeans.globalResid,
+      rateMeans.globalResid,
       xAt,
       xTarget,
       days,
       frozen,
+      nModel,
+      xLastRefresh,
+      xAnswer,
     ),
   );
   return { trophies };
