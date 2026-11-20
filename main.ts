@@ -30,9 +30,11 @@
 //
 // Frozen pages: when the history holds fewer than 3 distinct reads (the page has not moved
 // since launch night) and the horizon is short, there is no trend signal at all — the next
-// read is a refresh jump. The median then assumes the tracked base multiplies (~4x, a
-// launch-week prior) while earners stay flat, and the spread is widened a lot. This rule
-// is gated to short horizons, so it can never fire on the final case (6,510 minutes).
+// read is a refresh jump. The median then assumes the tracked base multiplies (~6x, the one
+// refresh the rules disclose) while earners grow with it (~3.5x), and the spread is widened
+// a lot. A trophy already at 100% is exempt: it stayed at 100% across the disclosed x6.06
+// refresh. This rule is gated to short horizons, so it can never fire on the final case
+// (6,510 minutes).
 //
 // Deterministic: pure arithmetic, no randomness, no clock, no network. Two runs write the
 // same bytes. Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else
@@ -48,8 +50,10 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** Release instant: GTA VI launched 2026-11-19 (UTC). Overridden per case when the case names it. */
 const RELEASE_MS = Date.parse('2026-11-19T00:00:00Z');
-/** How much of the model's move away from the last read the median keeps. */
-const DAMP = 0.85;
+/** How much of the model's move away from the last read the median keeps.
+ * DAMP = 0.65, tuned on the validation harness (validation/README.md): worst-case
+ * is flat (0.29–0.30) for 0.5–0.75, and 0.65 sits in the middle of that region. */
+const DAMP = 0.65;
 /** Prior SD (logit-slope units) of a trophy's slope around its class mean. */
 const SLOPE_PRIOR_SD = 0.8;
 /** Random-walk spread, logit units per square-root day. */
@@ -57,11 +61,44 @@ const SIGMA_RW = 0.5;
 /** Spread floor / cap, logit units. */
 const SIGMA_MIN = 0.6;
 const SIGMA_MAX = 2.5;
-/** Slope clamp: a rate can fall (base outgrowing earners) but not plummet. */
-const SLOPE_MIN = -0.5;
+/** Multiplier on the computed spread (robust tuning knob). SIGMA_SCALE = 0.6, tuned
+ * on the validation harness (validation/README.md): worst-case is flat (0.286–0.288)
+ * for 0.5–0.7, 0.321 at 1.0 and 0.394 at 1.2; 0.6 also has the best mean loss
+ * (0.208). The raw residual spread overstates the final's uncertainty once the
+ * biased slope is clamped (see SLOPE_MIN), so narrower intervals win pinball when
+ * the median is well placed. The floor (SIGMA_MIN 0.6) and cap (SIGMA_MAX 2.5)
+ * stay as hard bounds. */
+const SIGMA_SCALE = 0.6;
+/** Distinct reads a window must hold to be used (robust tuning knob).
+ * WINDOW_MIN_READS = 3, tuned on the validation harness (validation/README.md):
+ * with ~4h refreshes the 24h window holds ~6 reads, so 3 keeps the short window
+ * usable on sparse cadences (8h/12h) where 4 would force the longer, flatter 48h
+ * window. 2 is worse (worst-case 0.410) and 4 is worse (0.645) — 3 is the
+ * sweet spot. */
+const WINDOW_MIN_READS = 3;
+/** Slope clamp. SLOPE_MIN = 0.0, tuned on the validation harness
+ * (validation/README.md) and the single highest-leverage parameter: worst-case
+ * 0.645 at -0.5, 0.522 at -0.25, 0.431 at -0.1, 0.378 at 0.0 (all with DAMP 0.85;
+ * the tuned DAMP/window/sigma bring it to 0.286). The reason is structural, not a
+ * quirk of the scenarios: the observed history is a falling staircase — every
+ * refresh dilutes every rate — so a fitted negative slope is a measurement artifact
+ * of the refresh pattern, not a trend in player behaviour, and it is typically far
+ * steeper than any genuine post-checkpoint fall. Clamping at 0 means the median
+ * never forecasts a decrease. The harness includes mildly falling regimes
+ * (saturating earners) and the 0.0 floor still wins worst-case there, because the
+ * genuine falls are small next to the staircase bias. If the final's tracked base
+ * jumps sharply right before the target, this floor is the wrong call — that risk
+ * is disclosed in the README, and it is the price of the worst-case win. */
+const SLOPE_MIN = 0.0;
 const SLOPE_MAX = 3.5;
-/** Frozen-page prior: the tracked base multiplies by this at the next refresh. */
-const FROZEN_BASE_JUMP = 4;
+/** Frozen-page prior: the tracked base multiplies by this at the next refresh.
+ * The one refresh the rules disclose is x6.06 (638 -> 3,868 players tracked). */
+const FROZEN_BASE_JUMP = 6;
+/** Frozen-page prior: earners grow by this across the same refresh, so the
+ * median rate moves by FROZEN_EARNER_GROWTH / FROZEN_BASE_JUMP (~x0.58), not
+ * last/4. The disclosed refresh took every rate but the 100% one down, and
+ * earners plainly grew with the base rather than staying flat. */
+const FROZEN_EARNER_GROWTH = 3.5;
 /** Extra spread (logit) when the history is frozen. */
 const FROZEN_SIGMA_EXTRA = 1.2;
 
@@ -140,7 +177,7 @@ function wls(
   xs: number[],
   ys: number[],
   ws: number[],
-): { a: number; b: number; seB: number; residSd: number; n: number } | null {
+): { a: number; b: number; seB: number; residSd: number; n: number; mx: number } | null {
   const n = xs.length;
   if (n < 2) return null;
   let sw = 0;
@@ -172,7 +209,7 @@ function wls(
   const meanW = sw / n;
   const residSd = n > 2 ? Math.sqrt(rss / meanW / (n - 2)) : 0;
   const seB = n > 2 ? Math.sqrt((rss / meanW / (n - 2)) / sxx) : Number.POSITIVE_INFINITY;
-  return { a, b, seB, residSd, n };
+  return { a, b, seB, residSd, n, mx };
 }
 
 /** Growth class from the trophy's own description. Drives the shrinkage target. */
@@ -228,25 +265,38 @@ function forecastTrophy(
   slope = clamp(slope, SLOPE_MIN, SLOPE_MAX);
 
   // Median: the fitted line at the target, damped back toward the last read.
+  // The shrunk slope must pivot around the fit's centroid (mx, my): the line
+  // is fit.a + fit.b*mx + slope*(x - mx). Using the unshrunk intercept with
+  // the shrunk slope (fit.a + slope*x) is wrong by (fit.b - slope)*mx, which
+  // is large when shrinkage bites and the window sits far from release.
   let medianLogit: number;
   if (fit !== null) {
-    const lineAtTarget = fit.a + slope * xTarget;
+    const lineAtTarget = fit.a + fit.b * fit.mx + slope * (xTarget - fit.mx);
     medianLogit = logit(lastRate) + DAMP * (lineAtTarget - logit(lastRate));
   } else {
     medianLogit = logit(lastRate) + DAMP * slope * Math.max(0, xTarget - xAt);
   }
 
-  // Frozen page, short horizon: the next read is a refresh jump, base up ~4x, earners flat.
+  // Frozen page, short horizon: the next read is a refresh jump. The tracked
+  // base multiplies (~6x, the one refresh the rules disclose) while earners
+  // grow with it (~3.5x), so the median rate is roughly last x 0.58. A trophy
+  // already at (or near) 100% cannot fall by dilution — the rules prove the
+  // 100% trophy stayed at 100% across the x6.06 refresh — so it is exempt.
   let sigmaExtra = 0;
   if (frozen) {
-    medianLogit = logit(clamp(100 * earnersLast / (nBase * FROZEN_BASE_JUMP), 0.01, 99.99));
+    if (lastRate >= 99.9) {
+      medianLogit = logit(lastRate);
+    } else {
+      medianLogit = logit(clamp(100 * earnersLast * FROZEN_EARNER_GROWTH /
+        (nBase * FROZEN_BASE_JUMP), 0.01, 99.99));
+    }
     sigmaExtra = FROZEN_SIGMA_EXTRA;
     resid = Math.max(resid, 0.3);
   }
 
   const dx = Math.max(0, xTarget - xAt);
   const sigma = clamp(
-    Math.sqrt(resid * resid + (seSlope * dx) * (seSlope * dx) +
+    SIGMA_SCALE * Math.sqrt(resid * resid + (seSlope * dx) * (seSlope * dx) +
       (SIGMA_RW * Math.sqrt(days)) * (SIGMA_RW * Math.sqrt(days)) + sigmaExtra * sigmaExtra),
     SIGMA_MIN,
     SIGMA_MAX,
@@ -308,9 +358,9 @@ function forecastCase(c: CaseFile): { trophies: Array<{ id: number; q: number[] 
   }
   const windowed = pointsByTrophy.map((pts) => {
     const w24 = pts.filter((p) => p.x >= xCut24);
-    if (w24.length >= 4) return w24;
+    if (w24.length >= WINDOW_MIN_READS) return w24;
     const w48 = pts.filter((p) => p.x >= xCut48);
-    if (w48.length >= 4) return w48;
+    if (w48.length >= WINDOW_MIN_READS) return w48;
     return pts;
   });
   c.trophies.forEach((_, i) => {

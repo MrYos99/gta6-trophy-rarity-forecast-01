@@ -29,7 +29,7 @@ logit(r) = a + b * ln(1 + hours since release)
 ```
 
 - **Local window.** The fit uses only the most recent reads (last 24h when they hold
-  4+ distinct reads, else last 48h, else all). The local slope is what extrapolates;
+  3+ distinct reads, else last 48h, else all). The local slope is what extrapolates;
   the launch transient would bend a longer fit, and logit(r) is concave in log-time,
   so a long window's average slope overstates the future.
 - **Deduplication.** Exophase refreshes in jumps, so long frozen stretches carry no
@@ -39,18 +39,30 @@ logit(r) = a + b * ln(1 + hours since release)
 - **Shrinkage.** Each trophy's slope is shrunk toward its class mean (story / activity /
   grind, classified from the trophy's own description, plus a platinum class), because a
   handful of noisy, quantised reads cannot support a free slope per trophy. Slopes are
-  clamped to [-0.5, 3.5]: a rate can fall when the tracked base outgrows its earners
-  (the platinum does exactly this).
-- **Damped median.** The fitted line at the target is damped 0.85× back toward the
+  clamped to [0.0, 3.5]. The floor is 0, not negative: the observed history is a
+  falling staircase — every refresh dilutes every rate — so a fitted negative slope is
+  a measurement artifact of the refresh pattern, not a trend in player behaviour, and
+  it is typically far steeper than any genuine post-checkpoint fall. The median never
+  forecasts a decrease.
+- **Centroid pivot (fixed 2026-11-20).** The shrunk slope pivots around the fit's
+  centroid, not around the unshrunk intercept: `lineAtTarget = fit.a + fit.b * mx +
+  slope * (xTarget - mx)`. Pivoting at x = 0 with the unshrunk intercept was a bug
+  that accidentally compensated for the staircase-biased slopes; it is fixed, and the
+  compensation is replaced by the SLOPE_MIN = 0.0 floor, which does the same job
+  deliberately. See validation/README.md.
+- **Damped median.** The fitted line at the target is damped 0.65× back toward the
   last read.
-- **Honest spread.** σ = fit residual + slope uncertainty × extrapolation distance +
-  a 0.5·√days random-walk term, floored at 0.6 and capped at 2.5 logit units. A
+- **Honest spread.** σ = 0.6 × sqrt(fit residual² + slope uncertainty² × distance² +
+  a 0.5·√days random-walk term), floored at 0.6 and capped at 2.5 logit units. A
   4.5-day launch-week extrapolation is genuinely uncertain, and pinball loss punishes
-  a too-narrow band far more than a slightly-too-wide one.
+  a too-narrow band far more than a slightly-too-wide one. The 0.6 multiplier was
+  tuned on the validation harness (validation/README.md).
 - **Frozen pages.** When the history holds fewer than 3 distinct reads and the horizon
   is short, there is no trend signal at all — the next read is a refresh jump. The
-  median then assumes the tracked base multiplies (~4×, a launch-week prior) while
-  earners stay flat, and the spread is widened. Gated to short horizons, so it never
+  median then assumes the tracked base multiplies (~6×, the one refresh the rules
+  disclose) while earners grow with it (~3.5×), so the median is roughly last × 0.58.
+  A trophy already at (or near) 100% is exempt: it stayed at 100% across the disclosed
+  x6.06 refresh, and it cannot fall by dilution. Gated to short horizons, so it never
   fires on the final case (6,510 minutes).
 
 ## Why not a count decomposition?
@@ -62,22 +74,35 @@ straight into every rate. One extrapolation beats two.
 
 ## Validation
 
-- **Practice cases** (frozen launch-night history): under the E-frozen-across-refresh
-  assumption the model scores mean pinball ≈ 0.35 vs the house persistence baseline's
-  ≈ 1.88. The frozen-page rule moves medians down by the base jump, in the right
-  direction and inside the band.
-- **Synthetic finals**: four simulated final cases (different growth rates, base
-  growth, and a different curve family — logistic in log-time) with refresh jumps,
-  quantisation, and 2 days of history. The model beats both house baselines on all
-  four (e.g. base case: 0.244 vs persistence 0.305 vs curve 0.252; logistic shape:
-  0.271 vs 0.349 vs 0.287).
+- **Practice cases** (frozen launch-night history): under the ASSUMED answer that
+  every rate dilutes by exactly x6.06 with earners flat, the model scores mean
+  pinball 0.694 (p00) / 0.695 (p01) vs the house persistence baseline's 1.688.
+  That assumed answer is NOT the real practice answer (none exists), and its
+  flat-earner premise is itself contradicted by the disclosed refresh, where
+  earners plainly grew with the base. The number is a consistency check only,
+  not a validation — do not compare it against the pre-fix code's 0.35 under
+  the same assumption, because the two codes answer different questions about
+  that invented world. The practice medians now follow the frozen rule:
+  id1 (platinum, last 0.63%) -> 0.3675, id2 (100%) -> 99.99 (exempt), id3
+  (last 1.25%) -> 0.7292.
+- **Synthetic finals** (`validation/`, 12 simulated final cases): the trend path
+  is scored across refresh cadences (2h/4h/8h/12h), rising and saturating earner
+  growth, and fast/slow dilution. The tuned model beats the best house baseline
+  on 11 of 12 scenarios, worst-case mean pinball 0.2861 (mean 0.2076), vs the
+  pre-fix code's worst-case 0.6098 and 2/12 wins on the same scenarios. Full
+  table, tuning sweeps, and the limits of these synthetic numbers are in
+  `validation/README.md` — read the limits before trusting the table.
 - **Edge cases**: empty history, single read, null rates, zero players_tracked — all
   produce valid output, never crash (a per-case fallback emits wide persistence).
-- **Determinism**: two runs over the practice inputs and over the edge cases produce
-  byte-identical outputs.
-- **Kit check**: `competition_open`, `snapshot`, `license_osi`, `entrypoint` all pass.
-  The only failing check is `transcripts_present`, which is satisfied at submit time
-  when the parent bundles this session.
+- **Determinism**: two runs over the practice inputs produce byte-identical outputs
+  (verified 2026-11-20 on the tuned code: 55 rows, quantiles non-decreasing).
+- **Kit check**: 14 passed, 0 failed, 5 skipped, 5 checked at submission —
+  measured 2026-11-20 against commit 483a812 + the existing bundle
+  (`gta6-trophy-rarity-forecast-01-transcripts.tar.gz`). The 5 submission-time
+  checks (repo_public, repo_owner, repo_created_after_open, commit_in_repo,
+  duplicate_snapshot) need the public GitHub repo + push at submit time.
+  Note: that check predates the fixes in this commit — re-run it after the
+  parent re-bundles the fix session.
 
 ## License
 
